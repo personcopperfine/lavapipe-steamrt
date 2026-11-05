@@ -61,6 +61,13 @@ jobs:
           cp out/BUILDINFO BUILDINFO
       - name: Publish release
         run: |
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" --latest --title "$TAG" --notes-file BUILDINFO \
-            --target "$GITHUB_SHA" lavapipe-x86_64.tar.gz SHA256SUMS BUILDINFO
+          # Replace assets in place on a rebuild: deleting first leaves a window
+          # where releases/latest 404s or serves mismatched SHA256SUMS.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber lavapipe-x86_64.tar.gz BUILDINFO
+            gh release upload "$TAG" --clobber SHA256SUMS
+            gh release edit "$TAG" --latest --notes-file BUILDINFO
+          else
+            gh release create "$TAG" --latest --title "$TAG" --notes-file BUILDINFO \
+              --target "$GITHUB_SHA" lavapipe-x86_64.tar.gz SHA256SUMS BUILDINFO
+          fi
