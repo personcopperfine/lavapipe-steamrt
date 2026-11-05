@@ -1,0 +1,242 @@
+lavapipe: enforce descriptor pool maxSets and recycle descriptor set memory
+
+lvp_AllocateDescriptorSets never returned VK_ERROR_OUT_OF_POOL_MEMORY, so an
+application that rotates pools on that error never resets them and live sets
+grow without bound. Every set owns its own memfd mapping, so the process runs
+into vm.max_map_count, mmap fails and lvp_descriptor_set_create writes to
+MAP_FAILED. Enforce maxSets (LVP_POOL_LIMIT=0 restores the old behaviour) and
+recycle freed set memory through a per-device FIFO keyed by page count, reused
+only after LVP_DSET_CACHE_DELAY newer frees (default 16384) because pools can
+be reset while queued work still reads the sets (LVP_DSET_CACHE=0 disables).
+diff --git a/src/gallium/frontends/lavapipe/lvp_descriptor_set.c b/src/gallium/frontends/lavapipe/lvp_descriptor_set.c
+index 03b0435..5388c7e 100644
+--- a/src/gallium/frontends/lavapipe/lvp_descriptor_set.c
++++ b/src/gallium/frontends/lavapipe/lvp_descriptor_set.c
+@@ -351,6 +351,86 @@ get_image_handle_bda(struct lvp_device *device, VkDeviceAddress address, size_t
+    return *handle;
+ }
+ 
++DEBUG_GET_ONCE_BOOL_OPTION(lvp_dset_cache, "LVP_DSET_CACHE", true)
++DEBUG_GET_ONCE_NUM_OPTION(lvp_dset_cache_delay, "LVP_DSET_CACHE_DELAY", 16384)
++
++#define LVP_DSET_CACHE_SLACK 4096
++
++static int
++lvp_dset_mem_bucket(uint64_t size)
++{
++   uint64_t pages = DIV_ROUND_UP(size, 4096);
++   if (!debug_get_option_lvp_dset_cache() || pages == 0 || pages > 16)
++      return -1;
++   return pages - 1;
++}
++
++static struct pipe_memory_allocation *
++lvp_dset_mem_get(struct lvp_device *device, uint64_t size)
++{
++   int b = lvp_dset_mem_bucket(size);
++   struct pipe_memory_allocation *pmem = NULL;
++   if (b >= 0) {
++      uint32_t delay = debug_get_option_lvp_dset_cache_delay();
++      uint32_t cap = delay + LVP_DSET_CACHE_SLACK;
++      simple_mtx_lock(&device->dset_mem_lock);
++      if (device->dset_mem_cache[b].count > delay) {
++         pmem = device->dset_mem_cache[b].slots[device->dset_mem_cache[b].head];
++         device->dset_mem_cache[b].head = (device->dset_mem_cache[b].head + 1) % cap;
++         device->dset_mem_cache[b].count--;
++      }
++      simple_mtx_unlock(&device->dset_mem_lock);
++      if (pmem)
++         return pmem;
++      size = (uint64_t)(b + 1) * 4096;
++   }
++   return device->pscreen->allocate_memory(device->pscreen, size);
++}
++
++static void
++lvp_dset_mem_put(struct lvp_device *device, struct pipe_memory_allocation *pmem)
++{
++   struct llvmpipe_memory_allocation *mem = (struct llvmpipe_memory_allocation *)pmem;
++   int b = lvp_dset_mem_bucket(mem->size);
++   if (b < 0 || mem->size != (uint64_t)(b + 1) * 4096) {
++      device->pscreen->free_memory(device->pscreen, pmem);
++      return;
++   }
++   uint32_t cap = debug_get_option_lvp_dset_cache_delay() + LVP_DSET_CACHE_SLACK;
++   struct pipe_memory_allocation *evict = NULL;
++   simple_mtx_lock(&device->dset_mem_lock);
++   if (!device->dset_mem_cache[b].slots)
++      device->dset_mem_cache[b].slots = calloc(cap, sizeof(*device->dset_mem_cache[b].slots));
++   if (!device->dset_mem_cache[b].slots) {
++      evict = pmem;
++   } else {
++      if (device->dset_mem_cache[b].count == cap) {
++         evict = device->dset_mem_cache[b].slots[device->dset_mem_cache[b].head];
++         device->dset_mem_cache[b].head = (device->dset_mem_cache[b].head + 1) % cap;
++         device->dset_mem_cache[b].count--;
++      }
++      uint32_t tail = (device->dset_mem_cache[b].head + device->dset_mem_cache[b].count) % cap;
++      device->dset_mem_cache[b].slots[tail] = pmem;
++      device->dset_mem_cache[b].count++;
++   }
++   simple_mtx_unlock(&device->dset_mem_lock);
++   if (evict)
++      device->pscreen->free_memory(device->pscreen, evict);
++}
++
++void
++lvp_descriptor_set_mem_cache_finish(struct lvp_device *device)
++{
++   uint32_t cap = debug_get_option_lvp_dset_cache_delay() + LVP_DSET_CACHE_SLACK;
++   for (unsigned i = 0; i < ARRAY_SIZE(device->dset_mem_cache); i++) {
++      for (uint32_t j = 0; j < device->dset_mem_cache[i].count; j++)
++         device->pscreen->free_memory(device->pscreen,
++                                      device->dset_mem_cache[i].slots[(device->dset_mem_cache[i].head + j) % cap]);
++      free(device->dset_mem_cache[i].slots);
++   }
++   simple_mtx_destroy(&device->dset_mem_lock);
++}
++
+ VkResult
+ lvp_descriptor_set_create(struct lvp_device *device,
+                           struct lvp_descriptor_set_layout *layout,
+@@ -386,7 +466,7 @@ lvp_descriptor_set_create(struct lvp_device *device,
+    };
+ 
+    set->bo = device->pscreen->resource_create_unbacked(device->pscreen, &template, &bo_size);
+-   set->pmem = device->pscreen->allocate_memory(device->pscreen, bo_size);
++   set->pmem = lvp_dset_mem_get(device, bo_size);
+ 
+    set->map = device->pscreen->map_memory(device->pscreen, set->pmem);
+    memset(set->map, 0, bo_size);
+@@ -419,13 +499,15 @@ lvp_descriptor_set_destroy(struct lvp_device *device,
+ {
+    pipe_resource_reference(&set->bo, NULL);
+    device->pscreen->unmap_memory(device->pscreen, set->pmem);
+-   device->pscreen->free_memory(device->pscreen, set->pmem);
++   lvp_dset_mem_put(device, set->pmem);
+ 
+    vk_descriptor_set_layout_unref(&device->vk, &set->layout->vk);
+    vk_object_base_finish(&set->base);
+    vk_free(&device->vk.alloc, set);
+ }
+ 
++DEBUG_GET_ONCE_BOOL_OPTION(lvp_pool_limit, "LVP_POOL_LIMIT", true)
++
+ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateDescriptorSets(
+     VkDevice                                    _device,
+     const VkDescriptorSetAllocateInfo*          pAllocateInfo,
+@@ -441,17 +523,26 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateDescriptorSets(
+       VK_FROM_HANDLE(lvp_descriptor_set_layout, layout,
+                       pAllocateInfo->pSetLayouts[i]);
+ 
++      if (debug_get_option_lvp_pool_limit() && pool->set_count >= pool->max_sets) {
++         result = VK_ERROR_OUT_OF_POOL_MEMORY;
++         break;
++      }
++
+       result = lvp_descriptor_set_create(device, layout, &set);
+       if (result != VK_SUCCESS)
+          break;
+ 
+       list_addtail(&set->link, &pool->sets);
++      pool->set_count++;
+       pDescriptorSets[i] = lvp_descriptor_set_to_handle(set);
+    }
+ 
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
+       lvp_FreeDescriptorSets(_device, pAllocateInfo->descriptorPool,
+                              i, pDescriptorSets);
++      for (i = 0; i < pAllocateInfo->descriptorSetCount; i++)
++         pDescriptorSets[i] = VK_NULL_HANDLE;
++   }
+ 
+    return result;
+ }
+@@ -463,12 +554,14 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_FreeDescriptorSets(
+     const VkDescriptorSet*                      pDescriptorSets)
+ {
+    VK_FROM_HANDLE(lvp_device, device, _device);
++   VK_FROM_HANDLE(lvp_descriptor_pool, pool, descriptorPool);
+    for (uint32_t i = 0; i < count; i++) {
+       VK_FROM_HANDLE(lvp_descriptor_set, set, pDescriptorSets[i]);
+ 
+       if (!set)
+          continue;
+       list_del(&set->link);
++      pool->set_count--;
+       lvp_descriptor_set_destroy(device, set);
+    }
+    return VK_SUCCESS;
+@@ -717,6 +810,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDescriptorPool(
+    vk_object_base_init(&device->vk, &pool->base,
+                        VK_OBJECT_TYPE_DESCRIPTOR_POOL);
+    pool->flags = pCreateInfo->flags;
++   pool->max_sets = pCreateInfo->maxSets;
+    list_inithead(&pool->sets);
+    *pDescriptorPool = lvp_descriptor_pool_to_handle(pool);
+    return VK_SUCCESS;
+@@ -730,6 +824,7 @@ static void lvp_reset_descriptor_pool(struct lvp_device *device,
+       list_del(&set->link);
+       lvp_descriptor_set_destroy(device, set);
+    }
++   pool->set_count = 0;
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL lvp_DestroyDescriptorPool(
+diff --git a/src/gallium/frontends/lavapipe/lvp_device.c b/src/gallium/frontends/lavapipe/lvp_device.c
+index 106eb15..96565ec 100644
+--- a/src/gallium/frontends/lavapipe/lvp_device.c
++++ b/src/gallium/frontends/lavapipe/lvp_device.c
+@@ -2103,6 +2103,8 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDevice(
+ 
+    device->group_handle_alloc = 1;
+ 
++   simple_mtx_init(&device->dset_mem_lock, mtx_plain);
++
+    result = vk_meta_device_init(&device->vk, &device->meta);
+    if (result != VK_SUCCESS)
+       goto fail_meta;
+@@ -2160,6 +2162,7 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroyDevice(
+    _mesa_hash_table_fini(&device->bda, NULL);
+    simple_mtx_destroy(&device->bda_lock);
+    pipe_resource_reference(&device->zero_buffer, NULL);
++   lvp_descriptor_set_mem_cache_finish(device);
+ 
+    for (uint32_t i = 0; i < device->queue_count; i++)
+       lvp_queue_finish(&device->queue[i]);
+diff --git a/src/gallium/frontends/lavapipe/lvp_private.h b/src/gallium/frontends/lavapipe/lvp_private.h
+index bae38fb..86b58c9 100644
+--- a/src/gallium/frontends/lavapipe/lvp_private.h
++++ b/src/gallium/frontends/lavapipe/lvp_private.h
+@@ -234,6 +234,12 @@ struct lvp_device {
+ 
+    uint32_t group_handle_alloc;
+ 
++   simple_mtx_t dset_mem_lock;
++   struct {
++      struct pipe_memory_allocation **slots;
++      uint32_t head, count;
++   } dset_mem_cache[16];
++
+    struct vk_meta_device meta;
+    struct vk_acceleration_structure_build_args accel_struct_args;
+ 
+@@ -394,6 +400,7 @@ struct lvp_descriptor_pool {
+    struct vk_object_base base;
+    VkDescriptorPoolCreateFlags flags;
+    uint32_t max_sets;
++   uint32_t set_count;
+ 
+    struct list_head sets;
+ };
+@@ -403,6 +410,9 @@ lvp_descriptor_set_create(struct lvp_device *device,
+                           struct lvp_descriptor_set_layout *layout,
+                           struct lvp_descriptor_set **out_set);
+ 
++void
++lvp_descriptor_set_mem_cache_finish(struct lvp_device *device);
++
+ void
+ lvp_descriptor_set_destroy(struct lvp_device *device,
+                            struct lvp_descriptor_set *set);

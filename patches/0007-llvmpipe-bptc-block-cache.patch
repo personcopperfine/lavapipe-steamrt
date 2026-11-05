@@ -1,0 +1,302 @@
+llvmpipe: per-thread decoded-block cache for BPTC (BC7/BC6H) texel fetch
+
+gallivm has no vector BPTC decoder, so every BC7/BC6H texel fell back to a C
+fetch that decodes the whole 16-byte block header and endpoints for one texel.
+Keep a small per-thread cache of fully decoded 4x4 blocks keyed by block
+address, invalidated per scene, compute task and draw. LP_BPTC=0 disables it
+for A/B runs (bit 1 cache, bit 2 fetch routing; default 3).
+--- a/src/gallium/auxiliary/gallivm/lp_bld_format.h
++++ b/src/gallium/auxiliary/gallivm/lp_bld_format.h
+@@ -206,6 +206,12 @@
+                              LLVMValueRef j,
+                              LLVMValueRef cache);
+ 
++void
++lp_build_bptc_cache_reset(void);
++
++unsigned
++lp_build_bptc_flags(void);
++
+ /*
+  * special float formats
+  */
+--- a/src/gallium/auxiliary/gallivm/lp_bld_format_aos.c
++++ b/src/gallium/auxiliary/gallivm/lp_bld_format_aos.c
+@@ -34,6 +34,9 @@
+ 
+ 
+ #include "util/format/u_format.h"
++#include "util/format/u_format_bptc.h"
++#include "util/format_srgb.h"
++#include "util/u_math.h"
+ #include "util/bitscan.h"
+ #include "util/u_endian.h"
+ #include "util/u_pointer.h"
+@@ -54,6 +57,186 @@
+ #include "lp_bld_bitarit.h"
+ #include "lp_bld_misc.h"
+ 
++#define LP_BPTC_CACHE_SIZE 1024
++#define LP_BPTC_FCACHE_SIZE 256
++
++struct lp_bptc_cache {
++   unsigned epoch;
++   unsigned tag_epoch[LP_BPTC_CACHE_SIZE];
++   const uint8_t *tag[LP_BPTC_CACHE_SIZE];
++   uint8_t rgba[LP_BPTC_CACHE_SIZE][16][4];
++   unsigned ftag_epoch[LP_BPTC_FCACHE_SIZE];
++   const uint8_t *ftag[LP_BPTC_FCACHE_SIZE];
++   bool fsigned[LP_BPTC_FCACHE_SIZE];
++   float frgba[LP_BPTC_FCACHE_SIZE][16][4];
++};
++
++static __thread struct lp_bptc_cache *lp_bptc_tls;
++
++unsigned
++lp_build_bptc_flags(void)
++{
++   static int flags = -1;
++
++   if (flags < 0) {
++      const char *e = getenv("LP_BPTC");
++      flags = e ? atoi(e) : 3;
++   }
++   return flags;
++}
++
++void
++lp_build_bptc_cache_reset(void)
++{
++   struct lp_bptc_cache *c = lp_bptc_tls;
++
++   if (c && ++c->epoch == 0) {
++      memset(c->tag_epoch, 0, sizeof(c->tag_epoch));
++      memset(c->ftag_epoch, 0, sizeof(c->ftag_epoch));
++      c->epoch = 1;
++   }
++}
++
++static inline struct lp_bptc_cache *
++lp_bptc_cache_get(void)
++{
++   struct lp_bptc_cache *c = lp_bptc_tls;
++
++   if (!(lp_build_bptc_flags() & 1))
++      return NULL;
++   if (unlikely(!c)) {
++      c = calloc(1, sizeof(*c));
++      if (c)
++         c->epoch = 1;
++      lp_bptc_tls = c;
++   }
++   return c;
++}
++
++static inline unsigned
++lp_bptc_slot(const uint8_t *src, unsigned size)
++{
++   uintptr_t a = (uintptr_t)src >> 4;
++
++   return (unsigned)(a ^ (a >> 10)) & (size - 1);
++}
++
++static inline void
++lp_bptc_unorm_texel(uint8_t dst[4], const uint8_t *src, unsigned i, unsigned j)
++{
++   struct lp_bptc_cache *c = lp_bptc_cache_get();
++   unsigned t = (j & 3) * 4 + (i & 3);
++
++   if (unlikely(!c)) {
++      uint8_t blk[16][4];
++      util_format_bptc_rgba_unorm_unpack_rgba_8unorm(&blk[0][0], 16, src, 16, 4, 4);
++      memcpy(dst, blk[t], 4);
++      return;
++   }
++
++   unsigned s = lp_bptc_slot(src, LP_BPTC_CACHE_SIZE);
++   if (c->tag[s] != src || c->tag_epoch[s] != c->epoch) {
++      util_format_bptc_rgba_unorm_unpack_rgba_8unorm(&c->rgba[s][0][0], 16, src, 16, 4, 4);
++      c->tag[s] = src;
++      c->tag_epoch[s] = c->epoch;
++   }
++   memcpy(dst, c->rgba[s][t], 4);
++}
++
++static void
++lp_bptc_fetch_rgba_8unorm(uint8_t *restrict dst, const uint8_t *restrict src,
++                          unsigned i, unsigned j)
++{
++   lp_bptc_unorm_texel(dst, src, i, j);
++}
++
++static void
++lp_bptc_unorm_fetch_rgba(void *restrict dst, const uint8_t *restrict src,
++                         unsigned i, unsigned j)
++{
++   float *d = dst;
++   uint8_t t[4];
++
++   lp_bptc_unorm_texel(t, src, i, j);
++   for (unsigned k = 0; k < 4; k++)
++      d[k] = ubyte_to_float(t[k]);
++}
++
++static void
++lp_bptc_srgba_fetch_rgba(void *restrict dst, const uint8_t *restrict src,
++                         unsigned i, unsigned j)
++{
++   float *d = dst;
++   uint8_t t[4];
++
++   lp_bptc_unorm_texel(t, src, i, j);
++   for (unsigned k = 0; k < 3; k++)
++      d[k] = util_format_srgb_8unorm_to_linear_float(t[k]);
++   d[3] = ubyte_to_float(t[3]);
++}
++
++static inline void
++lp_bptc_float_texel(float *dst, const uint8_t *src, unsigned i, unsigned j,
++                    bool is_signed)
++{
++   struct lp_bptc_cache *c = lp_bptc_cache_get();
++   unsigned t = (j & 3) * 4 + (i & 3);
++
++   if (unlikely(!c)) {
++      if (is_signed)
++         util_format_bptc_rgb_float_fetch_rgba(dst, src, i & 3, j & 3);
++      else
++         util_format_bptc_rgb_ufloat_fetch_rgba(dst, src, i & 3, j & 3);
++      return;
++   }
++
++   unsigned s = lp_bptc_slot(src, LP_BPTC_FCACHE_SIZE);
++   if (c->ftag[s] != src || c->ftag_epoch[s] != c->epoch ||
++       c->fsigned[s] != is_signed) {
++      if (is_signed)
++         util_format_bptc_rgb_float_unpack_rgba_float(&c->frgba[s][0][0], 64, src, 16, 4, 4);
++      else
++         util_format_bptc_rgb_ufloat_unpack_rgba_float(&c->frgba[s][0][0], 64, src, 16, 4, 4);
++      c->ftag[s] = src;
++      c->ftag_epoch[s] = c->epoch;
++      c->fsigned[s] = is_signed;
++   }
++   memcpy(dst, c->frgba[s][t], 16);
++}
++
++static void
++lp_bptc_float_fetch_rgba(void *restrict dst, const uint8_t *restrict src,
++                         unsigned i, unsigned j)
++{
++   lp_bptc_float_texel(dst, src, i, j, true);
++}
++
++static void
++lp_bptc_ufloat_fetch_rgba(void *restrict dst, const uint8_t *restrict src,
++                          unsigned i, unsigned j)
++{
++   lp_bptc_float_texel(dst, src, i, j, false);
++}
++
++static util_format_fetch_rgba_func_ptr
++lp_bptc_fetch_rgba_func(enum pipe_format format)
++{
++   if (!(lp_build_bptc_flags() & 2))
++      return util_format_fetch_rgba_func(format);
++   switch (format) {
++   case PIPE_FORMAT_BPTC_RGBA_UNORM:
++      return lp_bptc_unorm_fetch_rgba;
++   case PIPE_FORMAT_BPTC_SRGBA:
++      return lp_bptc_srgba_fetch_rgba;
++   case PIPE_FORMAT_BPTC_RGB_FLOAT:
++      return lp_bptc_float_fetch_rgba;
++   case PIPE_FORMAT_BPTC_RGB_UFLOAT:
++      return lp_bptc_ufloat_fetch_rgba;
++   default:
++      return util_format_fetch_rgba_func(format);
++   }
++}
++
+ /**
+  * Basic swizzling.  Rearrange the order of the unswizzled array elements
+  * according to the format description.  PIPE_SWIZZLE_0/ONE are supported
+@@ -795,7 +978,14 @@
+     * Fallback to util_format_description::fetch_rgba_8unorm().
+     */
+ 
+-   if (unpack->fetch_rgba_8unorm &&
++   void (*fetch_rgba_8unorm)(uint8_t *restrict dst, const uint8_t *restrict src,
++                             unsigned i, unsigned j) = unpack->fetch_rgba_8unorm;
++   if ((lp_build_bptc_flags() & 2) &&
++       (format_desc->format == PIPE_FORMAT_BPTC_RGBA_UNORM ||
++        format_desc->format == PIPE_FORMAT_BPTC_SRGBA))
++      fetch_rgba_8unorm = lp_bptc_fetch_rgba_8unorm;
++
++   if (fetch_rgba_8unorm &&
+        !type.floating && type.width == 8 && !type.sign && type.norm) {
+       /*
+        * Fallback to calling util_format_description::fetch_rgba_8unorm.
+@@ -846,7 +1036,7 @@
+          gallivm->cache->dont_cache = true;
+       /* make const pointer for the C fetch_rgba_8unorm function */
+       function = lp_build_const_int_pointer(gallivm,
+-                                            func_to_pointer((func_pointer) unpack->fetch_rgba_8unorm));
++                                            func_to_pointer((func_pointer) fetch_rgba_8unorm));
+       /* cast the callee pointer to the function's type */
+       function = LLVMBuildBitCast(builder, function, LLVMPointerType(function_type, 0), "cast callee");
+ 
+@@ -899,7 +1089,7 @@
+     */
+ 
+    util_format_fetch_rgba_func_ptr fetch_rgba =
+-      util_format_fetch_rgba_func(format_desc->format);
++      lp_bptc_fetch_rgba_func(format_desc->format);
+    if (fetch_rgba) {
+       /*
+        * Fallback to calling util_format_description::fetch_rgba_float.
+--- a/src/gallium/drivers/llvmpipe/lp_cs_tpool.c
++++ b/src/gallium/drivers/llvmpipe/lp_cs_tpool.c
+@@ -31,6 +31,7 @@
+ #include "util/u_thread.h"
+ #include "util/u_memory.h"
+ #include "util/u_math.h"
++#include "gallivm/lp_bld_format.h"
+ #include "lp_cs_tpool.h"
+ #include "compiler/shader_enums.h"
+ 
+@@ -86,6 +87,7 @@
+             flush_denorms = true;
+          }
+       }
++      lp_build_bptc_cache_reset();
+       for (unsigned i = 0; i < iter_per_thread; i++)
+          task->work(task->data, this_iter + i, &lmem);
+ 
+--- a/src/gallium/drivers/llvmpipe/lp_draw_arrays.c
++++ b/src/gallium/drivers/llvmpipe/lp_draw_arrays.c
+@@ -41,6 +41,7 @@
+ #include "lp_query.h"
+ 
+ #include "draw/draw_context.h"
++#include "gallivm/lp_bld_format.h"
+ 
+ 
+ 
+@@ -65,6 +66,8 @@
+    const void *mapped_indices = NULL;
+    unsigned i;
+ 
++   lp_build_bptc_cache_reset();
++
+    if (!llvmpipe_check_render_cond(lp))
+       return;
+ 
+--- a/src/gallium/drivers/llvmpipe/lp_rast.c
++++ b/src/gallium/drivers/llvmpipe/lp_rast.c
+@@ -1054,6 +1054,7 @@
+                 struct lp_scene *scene)
+ {
+    task->scene = scene;
++   lp_build_bptc_cache_reset();
+ 
+    /* Clear the cache tags. This should not always be necessary but
+     * simpler for now.

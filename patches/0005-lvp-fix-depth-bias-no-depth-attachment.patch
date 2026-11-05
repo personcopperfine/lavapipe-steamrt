@@ -1,0 +1,12 @@
+--- a/src/gallium/frontends/lavapipe/lvp_execute.c
++++ b/src/gallium/frontends/lavapipe/lvp_execute.c
+@@ -594,7 +594,8 @@ static void emit_state(struct rendering_state *state)
+             state->depth_bias.representation == VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT ||
+             state->depth_bias.representation == VK_DEPTH_BIAS_REPRESENTATION_FLOAT_EXT;
+ 
+-         if (state->depth_bias.representation == VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT) {
++         if (state->depth_bias.representation == VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT &&
++             state->depth_att.imgv) {
+             enum pipe_format depth_format = util_format_get_depth_only(state->depth_att.imgv->pformat);
+             const struct util_format_description *desc = util_format_description(depth_format);
+             state->rs_state.offset_units *= util_get_depth_format_mrd(desc);

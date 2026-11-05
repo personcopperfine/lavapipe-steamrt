@@ -1,0 +1,482 @@
+lvp-cs2-trace v6: env-gated LVP_CS2_TRACE instrumentation for CS2 boot debug.
+v6: no texture_map inside command execution any more. v4/v5 hashed attachments
+at END_RENDERING and imgop sources/destinations mid-execution; mapping render
+targets from the queue thread stalls the game's loader (map load hangs at the
+loading screen, engine trickles ~1 frame/40s; trace off loads in ~20s).
+Counters and metadata logs stay; only hash_sw still maps, at submit end.
+v5: hash_imgop only considered registry swapchain images (use-after-free fix).
+diff -ru a/src/gallium/frontends/lavapipe b/src/gallium/frontends/lavapipe
+--- a/src/gallium/frontends/lavapipe/lvp_device.c
++++ b/src/gallium/frontends/lavapipe/lvp_device.c
+@@ -1906,9 +1906,16 @@
+    struct lvp_queue *queue = container_of(vk_queue, struct lvp_queue, vk);
+    struct lvp_device *device = lvp_queue_device(queue);
+ 
++   bool trace = debug_get_bool_option("LVP_CS2_TRACE", false);
++   int64_t wait_start = trace ? os_time_get_nano() : 0;
+    VkResult result = vk_sync_wait_many(&device->vk,
+                                        submit->wait_count, submit->waits,
+                                        VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
++   if (trace)
++      fprintf(stderr, "lvp-cs2-trace: submit waits=%u wait_ms=%llu rc=%d\n",
++              submit->wait_count,
++              (unsigned long long)(os_time_get_nano() - wait_start) / 1000000,
++              (int)result);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+diff -ru a/src/gallium/frontends/lavapipe b/src/gallium/frontends/lavapipe
+--- a/src/gallium/frontends/lavapipe/lvp_execute.c
++++ b/src/gallium/frontends/lavapipe/lvp_execute.c
+@@ -39,6 +39,8 @@
+ #include "util/u_surface.h"
+ #include "util/u_sampler.h"
+ #include "util/box.h"
++#include "util/os_time.h"
++#include "util/u_debug.h"
+ #include "util/u_inlines.h"
+ #include "util/u_math.h"
+ #include "util/u_memory.h"
+@@ -1931,6 +1933,335 @@
+ }
+ 
+ 
++#define LVP_CS2_TRACE_SW_MAX 24
++
++static simple_mtx_t lvp_cs2_trace_sw_mtx = SIMPLE_MTX_INITIALIZER;
++
++struct lvp_cs2_sw_img {
++   VkImage handle;
++   struct pipe_resource *bo;
++   uint32_t w, h;
++   int fmt, tiling;
++   uint64_t usage;
++   bool alias;
++};
++
++static struct {
++   bool enabled;
++   bool inited;
++   uint64_t frame;
++   uint64_t draws, dispatches, rpasses, copies, blits, clears;
++   uint32_t hash;
++   uint64_t hash_nz, hash_rows;
++   bool hashed;
++   uint64_t copy_src_nz, copy_dst_nz;
++   uint32_t copy_dst_hash;
++   bool copy_hashed;
++   uint64_t copy_ops;
++   int64_t last_ns, last_hash_ns, last_copy_hash_ns, last_sw_hash_ns;
++   uint64_t sw_nz, sw_rows;
++   unsigned sw_hashed;
++   uint64_t attach_ops;
++   struct lvp_cs2_sw_img sw[LVP_CS2_TRACE_SW_MAX];
++   unsigned sw_count;
++} lvp_cs2_trace;
++
++static void
++lvp_cs2_trace_init(void)
++{
++   lvp_cs2_trace.enabled = debug_get_bool_option("LVP_CS2_TRACE", false);
++   lvp_cs2_trace.hash = 2166136261u;
++   lvp_cs2_trace.copy_dst_hash = 2166136261u;
++   lvp_cs2_trace.inited = true;
++}
++
++void
++lvp_cs2_trace_sw_register(const VkImageCreateInfo *ci, VkImage image, bool alias)
++{
++   simple_mtx_lock(&lvp_cs2_trace_sw_mtx);
++   if (!lvp_cs2_trace.inited)
++      lvp_cs2_trace_init();
++   if (!lvp_cs2_trace.enabled)
++      goto out;
++   for (unsigned i = 0; i < lvp_cs2_trace.sw_count; i++) {
++      if (lvp_cs2_trace.sw[i].handle == image)
++         goto out;
++   }
++   if (lvp_cs2_trace.sw_count >= LVP_CS2_TRACE_SW_MAX) {
++      fprintf(stderr, "lvp-cs2-trace: swimg full, dropping handle=%p\n", (void *)image);
++      goto out;
++   }
++   struct lvp_cs2_sw_img *e = &lvp_cs2_trace.sw[lvp_cs2_trace.sw_count++];
++   e->handle = image;
++   e->bo = lvp_image_from_handle(image)->planes[0].bo;
++   e->w = ci->extent.width;
++   e->h = ci->extent.height;
++   e->fmt = ci->format;
++   e->tiling = ci->tiling;
++   e->usage = (uint64_t)ci->usage;
++   e->alias = alias;
++   fprintf(stderr,
++           "lvp-cs2-trace: swimg add i=%u kind=%s handle=%p extent=%ux%u "
++           "format=%d tiling=%d usage=0x%llx\n",
++           lvp_cs2_trace.sw_count - 1, alias ? "alias" : "lin",
++           (void *)image, e->w, e->h, e->fmt, e->tiling,
++           (unsigned long long)e->usage);
++out:
++   simple_mtx_unlock(&lvp_cs2_trace_sw_mtx);
++}
++
++void
++lvp_cs2_trace_sw_unregister(VkImage image)
++{
++   simple_mtx_lock(&lvp_cs2_trace_sw_mtx);
++   for (unsigned i = 0; i < lvp_cs2_trace.sw_count; i++) {
++      if (lvp_cs2_trace.sw[i].handle != image)
++         continue;
++      memmove(&lvp_cs2_trace.sw[i], &lvp_cs2_trace.sw[i + 1],
++              (lvp_cs2_trace.sw_count - i - 1) * sizeof(lvp_cs2_trace.sw[0]));
++      lvp_cs2_trace.sw_count--;
++      break;
++   }
++   simple_mtx_unlock(&lvp_cs2_trace_sw_mtx);
++}
++
++static int
++lvp_cs2_trace_sw_find(VkImage image)
++{
++   int r = -1;
++   simple_mtx_lock(&lvp_cs2_trace_sw_mtx);
++   for (unsigned i = 0; i < lvp_cs2_trace.sw_count; i++) {
++      if (lvp_cs2_trace.sw[i].handle == image) {
++         r = (int)i;
++         break;
++      }
++   }
++   simple_mtx_unlock(&lvp_cs2_trace_sw_mtx);
++   return r;
++}
++
++static int
++lvp_cs2_trace_sw_find_bo(struct pipe_resource *bo)
++{
++   int r = -1;
++   simple_mtx_lock(&lvp_cs2_trace_sw_mtx);
++   for (unsigned i = 0; i < lvp_cs2_trace.sw_count; i++) {
++      if (lvp_cs2_trace.sw[i].bo == bo) {
++         r = (int)i;
++         break;
++      }
++   }
++   simple_mtx_unlock(&lvp_cs2_trace_sw_mtx);
++   return r;
++}
++
++static void
++lvp_cs2_trace_count(enum vk_cmd_type type)
++{
++   switch (type) {
++   case VK_CMD_DRAW:
++   case VK_CMD_DRAW_INDEXED:
++   case VK_CMD_DRAW_INDIRECT:
++   case VK_CMD_DRAW_INDEXED_INDIRECT:
++   case VK_CMD_DRAW_INDIRECT_COUNT:
++   case VK_CMD_DRAW_INDEXED_INDIRECT_COUNT:
++   case VK_CMD_DRAW_MULTI_EXT:
++   case VK_CMD_DRAW_MULTI_INDEXED_EXT:
++      lvp_cs2_trace.draws++;
++      break;
++   case VK_CMD_DISPATCH:
++   case VK_CMD_DISPATCH_BASE:
++   case VK_CMD_DISPATCH_INDIRECT:
++      lvp_cs2_trace.dispatches++;
++      break;
++   case VK_CMD_BEGIN_RENDERING:
++      lvp_cs2_trace.rpasses++;
++      break;
++   case VK_CMD_COPY_IMAGE:
++   case VK_CMD_COPY_IMAGE2:
++      lvp_cs2_trace.copies++;
++      break;
++   case VK_CMD_BLIT_IMAGE:
++   case VK_CMD_BLIT_IMAGE2:
++      lvp_cs2_trace.blits++;
++      break;
++   case VK_CMD_CLEAR_ATTACHMENTS:
++   case VK_CMD_CLEAR_COLOR_IMAGE:
++   case VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE:
++      lvp_cs2_trace.clears++;
++      break;
++   default:
++      break;
++   }
++}
++
++static unsigned
++lvp_cs2_trace_hash_texture(struct rendering_state *state,
++                           struct pipe_resource *tex,
++                           uint32_t *hash, uint64_t *nz)
++{
++   struct pipe_box box = {0, 0, 0, 0, 0, 1};
++   struct pipe_transfer *t = NULL;
++   unsigned stride, row, rows = 0;
++   void *map;
++
++   if (!tex)
++      return 0;
++   box.width = tex->width0;
++   box.height = tex->height0;
++   map = state->pctx->texture_map(state->pctx, tex, 0,
++                                  PIPE_MAP_READ, &box, &t);
++   if (!map)
++      return 0;
++   stride = util_format_get_stride(tex->format, tex->width0);
++   row = MIN2(stride, 4096u);
++   const uint8_t *p = (const uint8_t *)map;
++   for (unsigned y = 0; y < tex->height0; y += 16) {
++      for (unsigned x = 0; x < row; x++) {
++         *hash = (*hash ^ p[y * stride + x]) * 16777619u;
++         *nz += p[y * stride + x] != 0;
++      }
++      rows++;
++   }
++   state->pctx->texture_unmap(state->pctx, t);
++   return rows;
++}
++
++static void
++lvp_cs2_trace_hash_attach(struct rendering_state *state)
++{
++   int64_t now = os_time_get_nano();
++
++   if (now - lvp_cs2_trace.last_hash_ns < 250 * 1000000)
++      return;
++   lvp_cs2_trace.last_hash_ns = now;
++
++   for (unsigned i = 0; i < state->framebuffer.nr_cbufs && i < PIPE_MAX_COLOR_BUFS; i++) {
++      struct pipe_surface *surf = &state->framebuffer.cbufs[i];
++
++      if (!surf || !surf->texture)
++         continue;
++      if (lvp_cs2_trace.attach_ops < 4)
++         fprintf(stderr,
++                 "lvp-cs2-trace: attach i=%u %ux%u fmt=%d handle=%p sw=%d\n",
++                 i, surf->texture->width0, surf->texture->height0,
++                 (int)surf->texture->format, (void *)surf->texture,
++                 lvp_cs2_trace_sw_find_bo(surf->texture));
++      lvp_cs2_trace.attach_ops++;
++   }
++}
++
++static void
++lvp_cs2_trace_hash_imgop(struct rendering_state *state, const char *op,
++                         VkImage src, VkImage dst)
++{
++   const struct lvp_image *si = lvp_image_from_handle(src);
++   const struct lvp_image *di = lvp_image_from_handle(dst);
++
++   if (lvp_cs2_trace.copy_ops < 8 && si && di)
++      fprintf(stderr,
++              "lvp-cs2-trace: imgop %s src=%p %ux%u dst=%p %ux%u "
++              "src_sw=%d dst_sw=%d\n",
++              op, (void *)src, si->vk.extent.width, si->vk.extent.height,
++              (void *)dst, di->vk.extent.width, di->vk.extent.height,
++              lvp_cs2_trace_sw_find(src), lvp_cs2_trace_sw_find(dst));
++   lvp_cs2_trace.copy_ops++;
++}
++
++static void
++lvp_cs2_trace_hash_sw(struct rendering_state *state)
++{
++   int64_t now = os_time_get_nano();
++
++   if (!lvp_cs2_trace.draws && !lvp_cs2_trace.copies && !lvp_cs2_trace.blits)
++      return;
++   if (now - lvp_cs2_trace.last_sw_hash_ns < 250 * 1000000)
++      return;
++   lvp_cs2_trace.last_sw_hash_ns = now;
++   simple_mtx_lock(&lvp_cs2_trace_sw_mtx);
++   for (unsigned i = 0; i < lvp_cs2_trace.sw_count; i++) {
++      struct lvp_image *img = lvp_image_from_handle(lvp_cs2_trace.sw[i].handle);
++      uint32_t ih = 2166136261u;
++      uint64_t inz = 0;
++      unsigned r = lvp_cs2_trace_hash_texture(state, img->planes[0].bo, &ih, &inz);
++
++      if (!r)
++         continue;
++      lvp_cs2_trace.sw_hashed++;
++      lvp_cs2_trace.sw_nz += inz;
++      lvp_cs2_trace.sw_rows += r;
++      fprintf(stderr,
++              "lvp-cs2-trace: swimg hash i=%u handle=%p %ux%u kind=%s nz=%llu rows=%u\n",
++              i, (void *)lvp_cs2_trace.sw[i].handle,
++              lvp_cs2_trace.sw[i].w, lvp_cs2_trace.sw[i].h,
++              lvp_cs2_trace.sw[i].alias ? "alias" : "lin",
++              (unsigned long long)inz, r);
++   }
++   simple_mtx_unlock(&lvp_cs2_trace_sw_mtx);
++}
++
++static void
++lvp_cs2_trace_summary(int64_t exec_start)
++{
++   int64_t now = os_time_get_nano();
++   uint64_t dt_ms = lvp_cs2_trace.last_ns ?
++      (uint64_t)(now - lvp_cs2_trace.last_ns) / 1000000 : 0;
++   uint64_t exec_ms = exec_start ?
++      (uint64_t)(now - exec_start) / 1000000 : 0;
++
++   fprintf(stderr,
++           "lvp-cs2-trace: frame=%llu draws=%llu dispatches=%llu rpasses=%llu "
++           "copies=%llu blits=%llu clears=%llu hash=%08x hashed=%u hash_nz=%llu "
++           "hash_rows=%llu copy_src_nz=%llu copy_dst_nz=%llu copy_dst_hash=%08x "
++           "exec_ms=%llu dt_ms=%llu "
++           "copy_hashed=%u copy_ops=%llu sw_imgs=%u sw_hashed=%u "
++           "sw_nz=%llu sw_rows=%llu\n",
++           (unsigned long long)lvp_cs2_trace.frame,
++           (unsigned long long)lvp_cs2_trace.draws,
++           (unsigned long long)lvp_cs2_trace.dispatches,
++           (unsigned long long)lvp_cs2_trace.rpasses,
++           (unsigned long long)lvp_cs2_trace.copies,
++           (unsigned long long)lvp_cs2_trace.blits,
++           (unsigned long long)lvp_cs2_trace.clears,
++           lvp_cs2_trace.hash,
++           lvp_cs2_trace.hashed ? 1u : 0u,
++           (unsigned long long)lvp_cs2_trace.hash_nz,
++           (unsigned long long)lvp_cs2_trace.hash_rows,
++           (unsigned long long)lvp_cs2_trace.copy_src_nz,
++           (unsigned long long)lvp_cs2_trace.copy_dst_nz,
++           lvp_cs2_trace.copy_dst_hash,
++           (unsigned long long)exec_ms,
++           (unsigned long long)dt_ms,
++           lvp_cs2_trace.copy_hashed ? 1u : 0u,
++           (unsigned long long)lvp_cs2_trace.copy_ops,
++           lvp_cs2_trace.sw_count,
++           lvp_cs2_trace.sw_hashed,
++           (unsigned long long)lvp_cs2_trace.sw_nz,
++           (unsigned long long)lvp_cs2_trace.sw_rows);
++
++   lvp_cs2_trace.frame++;
++   lvp_cs2_trace.draws = 0;
++   lvp_cs2_trace.dispatches = 0;
++   lvp_cs2_trace.rpasses = 0;
++   lvp_cs2_trace.copies = 0;
++   lvp_cs2_trace.blits = 0;
++   lvp_cs2_trace.clears = 0;
++   lvp_cs2_trace.hash = 2166136261u;
++   lvp_cs2_trace.hash_nz = 0;
++   lvp_cs2_trace.hash_rows = 0;
++   lvp_cs2_trace.hashed = false;
++   lvp_cs2_trace.copy_src_nz = 0;
++   lvp_cs2_trace.copy_dst_nz = 0;
++   lvp_cs2_trace.copy_dst_hash = 2166136261u;
++   lvp_cs2_trace.copy_hashed = false;
++   lvp_cs2_trace.copy_ops = 0;
++   lvp_cs2_trace.attach_ops = 0;
++   lvp_cs2_trace.sw_nz = 0;
++   lvp_cs2_trace.sw_rows = 0;
++   lvp_cs2_trace.sw_hashed = 0;
++   lvp_cs2_trace.last_ns = now;
++}
++
+ static void
+ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
+                        struct rendering_state *state)
+@@ -5558,6 +5889,8 @@
+          continue;
+       }
+ 
++      if (lvp_cs2_trace.enabled)
++         lvp_cs2_trace_count(cmd->type);
+       if (print_cmds)
+          fprintf(stderr, "%s\n", vk_cmd_queue_type_names[cmd->type]);
+       switch ((unsigned)cmd->type) {
+@@ -5650,9 +5983,17 @@
+          break;
+       case VK_CMD_COPY_IMAGE2:
+          handle_copy_image(cmd, state);
++         if (lvp_cs2_trace.enabled)
++            lvp_cs2_trace_hash_imgop(state, "copy",
++               cmd->u.copy_image2.copy_image_info->srcImage,
++               cmd->u.copy_image2.copy_image_info->dstImage);
+          break;
+       case VK_CMD_BLIT_IMAGE2:
+          handle_blit_image(cmd, state);
++         if (lvp_cs2_trace.enabled)
++            lvp_cs2_trace_hash_imgop(state, "blit",
++               cmd->u.blit_image2.blit_image_info->srcImage,
++               cmd->u.blit_image2.blit_image_info->dstImage);
+          break;
+       case VK_CMD_COPY_BUFFER_TO_IMAGE2:
+          handle_copy_buffer_to_image(cmd, state);
+@@ -5799,6 +6140,8 @@
+          break;
+       case VK_CMD_END_RENDERING2_KHR:
+          handle_end_rendering(cmd, state);
++         if (lvp_cs2_trace.enabled)
++            lvp_cs2_trace_hash_attach(state);
+          break;
+       case VK_CMD_BIND_INDEX_BUFFER3_KHR:
+          handle_index_buffer3(cmd, state);
+@@ -6087,7 +6430,15 @@
+    state->index_buffer = state->device->zero_buffer;
+ 
+    /* create a gallium context */
++   if (!lvp_cs2_trace.inited)
++      lvp_cs2_trace_init();
++
++   int64_t exec_start = lvp_cs2_trace.enabled ? os_time_get_nano() : 0;
+    lvp_execute_cmd_buffer(&cmd_buffer->vk.cmd_queue.cmds, state, device->print_cmds);
++   if (lvp_cs2_trace.enabled) {
++      lvp_cs2_trace_hash_sw(state);
++      lvp_cs2_trace_summary(exec_start);
++   }
+ 
+    state->start_vb = -1;
+    state->num_vb = 0;
+diff -ru a/src/gallium/frontends/lavapipe b/src/gallium/frontends/lavapipe
+--- a/src/gallium/frontends/lavapipe/lvp_image.c
++++ b/src/gallium/frontends/lavapipe/lvp_image.c
+@@ -243,13 +243,22 @@
+    VK_FROM_HANDLE(lvp_device, device, _device);
+ 
+    if (wsi_common_is_swapchain_image(pCreateInfo)) {
+-      return wsi_common_create_swapchain_image(&lvp_device_physical(device)->wsi_device,
+-                                               pCreateInfo,
+-                                               pImage);
++      VkResult result = wsi_common_create_swapchain_image(&lvp_device_physical(device)->wsi_device,
++                                                          pCreateInfo,
++                                                          pImage);
++      if (result == VK_SUCCESS)
++         lvp_cs2_trace_sw_register(pCreateInfo, *pImage, true);
++      return result;
+    }
+ 
+-   return lvp_image_create(_device, pCreateInfo, pAllocator,
+-                           pImage);
++   VkResult result = lvp_image_create(_device, pCreateInfo, pAllocator,
++                                      pImage);
++   if (result == VK_SUCCESS &&
++       pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
++       (pCreateInfo->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                              VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
++      lvp_cs2_trace_sw_register(pCreateInfo, *pImage, false);
++   return result;
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -261,6 +270,7 @@
+ 
+    if (!_image)
+      return;
++   lvp_cs2_trace_sw_unregister(_image);
+    for (unsigned p = 0; p < image->plane_count; p++)
+       pipe_resource_reference(&image->planes[p].bo, NULL);
+    vk_image_destroy(&device->vk, pAllocator, &image->vk);
+diff -ru a/src/gallium/frontends/lavapipe b/src/gallium/frontends/lavapipe
+--- a/src/gallium/frontends/lavapipe/lvp_private.h
++++ b/src/gallium/frontends/lavapipe/lvp_private.h
+@@ -843,6 +843,12 @@
+ 
+ enum vk_cmd_type
+ lvp_ext_dgc_token_to_cmd_type(const struct lvp_indirect_command_layout_ext *elayout, const VkIndirectCommandsLayoutTokenEXT *token);
++
++void
++lvp_cs2_trace_sw_register(const VkImageCreateInfo *ci, VkImage image, bool alias);
++
++void
++lvp_cs2_trace_sw_unregister(VkImage image);
+ size_t
+ lvp_ext_dgc_token_size(const struct lvp_indirect_command_layout_ext *elayout, const VkIndirectCommandsLayoutTokenEXT *token);
+ 

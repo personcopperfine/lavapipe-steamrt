@@ -1,0 +1,49 @@
+lvp: advertise subgroup size 32 (LVP_ADVERTISED_SUBGROUP_SIZE, default 32)
+
+CS2 drops every compute shader that declares requiredSubgroupSize=32 when the
+ICD advertises 8 (258x 'Will be ignored' per boot; its GPU-driven culling and
+sort shaders). llavapipe's subgroup size was lp_native_vector_width/32, and the
+vector infrastructure is capped at 512-bit vectors (LP_MAX_VECTOR_WIDTH), so
+executing at a true 32-lane subgroup is not reachable. Advertise 32 instead and
+keep the shaders; subgroup intrinsics still lower at the executed width.
+LVP_ADVERTISED_SUBGROUP_SIZE=8 restores the old behaviour for A/B runs.
+--- a/src/gallium/frontends/lavapipe/lvp_device.c
++++ b/src/gallium/frontends/lavapipe/lvp_device.c
+@@ -91,6 +91,17 @@
+    return (lp_native_vector_width / 32) >= 8;
+ }
+ 
++static int lvp_advertised_subgroup_size = -1;
++
++static unsigned
++lvp_subgroup_size(void)
++{
++   if (lvp_advertised_subgroup_size < 0)
++      lvp_advertised_subgroup_size =
++         debug_get_num_option("LVP_ADVERTISED_SUBGROUP_SIZE", 32);
++   return lvp_advertised_subgroup_size;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL lvp_EnumerateInstanceVersion(uint32_t* pApiVersion)
+ {
+    *pApiVersion = LVP_API_VERSION;
+@@ -1107,7 +1118,7 @@
+       .deviceLUIDValid = false,
+       .deviceNodeMask = 0,
+ 
+-      .subgroupSize = lp_native_vector_width / 32,
++      .subgroupSize = lvp_subgroup_size(),
+       .subgroupSupportedStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT,
+       .subgroupQuadOperationsInAllStages = true,
+@@ -1185,8 +1196,8 @@
+       .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT, /* LVP_SAMPLE_COUNTS? */
+ 
+       /* Vulkan 1.3 */
+-      .minSubgroupSize = lp_native_vector_width / 32,
+-      .maxSubgroupSize = lp_native_vector_width / 32,
++      .minSubgroupSize = lvp_subgroup_size(),
++      .maxSubgroupSize = lvp_subgroup_size(),
+       .maxComputeWorkgroupSubgroups = 32,
+       .requiredSubgroupSizeStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+       .maxInlineUniformTotalSize = MAX_DESCRIPTOR_UNIFORM_BLOCK_SIZE * MAX_PER_STAGE_DESCRIPTOR_UNIFORM_BLOCKS * MAX_SETS,

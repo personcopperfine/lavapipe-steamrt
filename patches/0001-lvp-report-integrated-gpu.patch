@@ -1,0 +1,24 @@
+--- a/src/gallium/frontends/lavapipe/lvp_device.c
++++ b/src/gallium/frontends/lavapipe/lvp_device.c
+@@ -976,13 +976,20 @@
+ 
+    int texel_buffer_alignment = device->pscreen->caps.texture_buffer_offset_alignment;
+ 
++   /* CS2 rejects a CPU device. Report as an integrated GPU (fork patch 0001).
++    * LVP_CS2_DEVICE_TYPE=cpu restores the honest value for A/B control. */
++   VkPhysicalDeviceType device_type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
++   const char *dt_env = getenv("LVP_CS2_DEVICE_TYPE");
++   if (dt_env && !strcmp(dt_env, "cpu"))
++      device_type = VK_PHYSICAL_DEVICE_TYPE_CPU;
++
+    *p = (struct vk_properties) {
+       /* Vulkan 1.0 */
+       .apiVersion = LVP_API_VERSION,
+       .driverVersion = vk_get_driver_version(),
+       .vendorID = VK_VENDOR_ID_MESA,
+       .deviceID = 0,
+-      .deviceType = VK_PHYSICAL_DEVICE_TYPE_CPU,
++      .deviceType = device_type,
+       .maxImageDimension1D                      = device->pscreen->caps.max_texture_2d_size,
+       .maxImageDimension2D                      = device->pscreen->caps.max_texture_2d_size,
+       .maxImageDimension3D                      = (1 << device->pscreen->caps.max_texture_3d_levels),

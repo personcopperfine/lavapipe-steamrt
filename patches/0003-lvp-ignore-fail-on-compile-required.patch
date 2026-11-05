@@ -1,0 +1,58 @@
+--- a/src/gallium/frontends/lavapipe/lvp_pipeline.c
++++ b/src/gallium/frontends/lavapipe/lvp_pipeline.c
+@@ -1147,13 +1147,22 @@
+       VkResult r = VK_PIPELINE_COMPILE_REQUIRED;
+       VkPipelineCreateFlagBits2KHR flags = vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
+ 
+-      if (!(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR))
+-         r = lvp_graphics_pipeline_create(_device,
+-                                          pipelineCache,
+-                                          &pCreateInfos[i],
+-                                          flags,
+-                                          &pPipelines[i],
+-                                          false);
++      /* Fork patch 0003: lavapipe compiles synchronously, so the flag is a
++       * no-op. CS2 sets it and never falls back on VK_PIPELINE_COMPILE_REQUIRED
++       * (NULL pipeline -> black frame). Treat it as absent; log once. */
++      if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
++         static bool warned = false;
++         if (!warned) {
++            fprintf(stderr, "lvp: ignoring FAIL_ON_PIPELINE_COMPILE_REQUIRED (graphics)\n");
++            warned = true;
++         }
++      }
++      r = lvp_graphics_pipeline_create(_device,
++                                       pipelineCache,
++                                       &pCreateInfos[i],
++                                       flags,
++                                       &pPipelines[i],
++                                       false);
+       if (r != VK_SUCCESS) {
+          result = r;
+          pPipelines[i] = VK_NULL_HANDLE;
+@@ -1253,12 +1262,19 @@
+       VkResult r = VK_PIPELINE_COMPILE_REQUIRED;
+       VkPipelineCreateFlagBits2KHR flags = vk_compute_pipeline_create_flags(&pCreateInfos[i]);
+ 
+-      if (!(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR))
+-         r = lvp_compute_pipeline_create(_device,
+-                                         pipelineCache,
+-                                         &pCreateInfos[i],
+-                                         flags,
+-                                         &pPipelines[i]);
++      /* Fork patch 0003: same as the graphics path above. */
++      if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
++         static bool warned = false;
++         if (!warned) {
++            fprintf(stderr, "lvp: ignoring FAIL_ON_PIPELINE_COMPILE_REQUIRED (compute)\n");
++            warned = true;
++         }
++      }
++      r = lvp_compute_pipeline_create(_device,
++                                      pipelineCache,
++                                      &pCreateInfos[i],
++                                      flags,
++                                      &pPipelines[i]);
+       if (r != VK_SUCCESS) {
+          result = r;
+          pPipelines[i] = VK_NULL_HANDLE;

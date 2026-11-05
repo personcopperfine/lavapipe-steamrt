@@ -1,0 +1,23 @@
+--- a/src/gallium/frontends/lavapipe/lvp_device.c
++++ b/src/gallium/frontends/lavapipe/lvp_device.c
+@@ -1745,13 +1745,13 @@
+ void
+ lvp_device_get_cache_uuid(void *uuid)
+ {
+-   memset(uuid, 'a', VK_UUID_SIZE);
+-   if (MESA_GIT_SHA1[0])
+-      /* debug build */
+-      memcpy(uuid, &MESA_GIT_SHA1[4], MIN2(strlen(MESA_GIT_SHA1) - 4, VK_UUID_SIZE));
+-   else
+-      /* release build */
+-      memcpy(uuid, PACKAGE_VERSION, MIN2(strlen(PACKAGE_VERSION), VK_UUID_SIZE));
++   /* Fork patch 0002: fixed pipeline cache UUID.
++    * Derived only from the fork series id + PACKAGE_VERSION, never from
++    * MESA_GIT_SHA1 (which changes on every local build and made CS2 delete
++    * shadercache/vulkan/shaders.cache on every boot with "UUID mismatch"). */
++   const char *seed = "lvp-cs2-fork-0003:" PACKAGE_VERSION;
++   memset(uuid, 0, VK_UUID_SIZE);
++   memcpy(uuid, seed, MIN2(strlen(seed), VK_UUID_SIZE));
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceQueueFamilyProperties2(
