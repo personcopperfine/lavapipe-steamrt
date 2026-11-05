@@ -1,5 +1,5 @@
 #!/bin/bash
-# Prints GitHub step outputs: tag=<upstream tag> build=<true|false> prerelease=<true|false>.
+# Prints GitHub step outputs: tag=<upstream tag> build=<true|false>.
 # build=false when a release for that tag already exists with our REVISION.
 set -euo pipefail
 . ./track.env
@@ -23,10 +23,7 @@ if [ "${FORCE:-false}" != true ] \
     && gh release view "$tag" --json body -q .body 2>/dev/null | grep -qx "revision=$rev"; then
     build=false
 fi
-prerelease=false
-case "$tag" in *-rc*) prerelease=true ;; esac
 
-echo "upstream=$tag revision=$rev build=$build prerelease=$prerelease" >&2
+echo "upstream=$tag revision=$rev build=$build" >&2
 echo "tag=$tag"
 echo "build=$build"
-echo "prerelease=$prerelease"

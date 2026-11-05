@@ -5,9 +5,10 @@ Mesa's lavapipe Vulkan software ICD with the cs2 patch series (`patches/`, see
 (`registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk`) against its LLVM 22,
 for cs2-docker.
 
-Releases mirror Mesa tags (`mesa-26.3.0`, `mesa-26.3.0-rc3`; rc tags are marked
-prerelease). A weekly job builds the newest tag matching `MESA_TRACK` in
-`track.env` if there is no release for it yet. Patches that no longer apply
+Releases mirror Mesa tags (`mesa-26.3.0`, `mesa-26.3.0-rc3`). rc builds are not
+marked prerelease, so `releases/latest` always points at the newest build. A
+weekly job builds the newest tag matching `MESA_TRACK` in `track.env` if there
+is no release for it yet. Patches that no longer apply
 fail the build; that is expected, rebase them and bump `REVISION`. Bumping
 `REVISION` rebuilds the same tag and replaces its release.
 
